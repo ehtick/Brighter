@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Text.Json;
 using System.Threading;
@@ -21,32 +22,44 @@ namespace Paramore.Brighter.MessagingGateway.MQTT
     public partial class MqttMessageConsumer : IAmAMessageConsumerSync, IAmAMessageConsumerAsync
     {
         private readonly string _topic;
-        private readonly Queue<Message> _messageQueue = new();
+        private readonly MqttMessagingGatewayConsumerConfiguration _configuration;
+        private readonly ConcurrentQueue<Message> _messageQueue = new();
         private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<MqttMessageConsumer>();
         private readonly Message _noopMessage = new();
         private readonly IMqttClient _mqttClient;
         private readonly MqttClientOptions _mqttClientOptions;
+        private readonly IAmAMessageScheduler? _scheduler;
+        private MqttMessageProducer? _requeueProducer;
+        private bool _requeueProducerInitialized;
+        private object? _requeueProducerLock;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="MqttMessageConsumer"/> class.
         /// </summary>
         /// <param name="configuration">
-        /// The configuration settings for the MQTT message consumer, including connection details, 
+        /// The configuration settings for the MQTT message consumer, including connection details,
         /// topic prefix, client credentials, and other options.
+        /// </param>
+        /// <param name="scheduler">
+        /// Optional scheduler for delayed message redelivery. When provided, the lazily-created
+        /// requeue producer will use this scheduler for delayed sends.
         /// </param>
         /// <exception cref="ArgumentNullException">
         /// Thrown when the <paramref name="configuration.TopicPrefix"/> is null.
         /// </exception>
         /// <remarks>
-        /// This constructor sets up the MQTT client with the provided configuration, establishes 
+        /// This constructor sets up the MQTT client with the provided configuration, establishes
         /// the connection to the broker, and subscribes to the specified topic.
         ///
         /// 04/03/2025:
         ///     - Removed support for user properties as they are not supported in v3.1.1 of the MQTT protocol.
         /// </remarks>
-        public MqttMessageConsumer(MqttMessagingGatewayConsumerConfiguration configuration)
+        public MqttMessageConsumer(MqttMessagingGatewayConsumerConfiguration configuration, IAmAMessageScheduler? scheduler = null)
         {
-            _topic = $"{configuration.TopicPrefix}/#" ?? throw new ArgumentNullException(nameof(configuration.TopicPrefix));
+            _configuration = configuration;
+            _scheduler = scheduler;
+            ArgumentNullException.ThrowIfNull(configuration.TopicPrefix, nameof(configuration.TopicPrefix));
+            _topic = $"{configuration.TopicPrefix}/#";
 
             MqttClientOptionsBuilder mqttClientOptionsBuilder = new MqttClientOptionsBuilder()
                .WithTcpServer(configuration.Hostname)
@@ -97,6 +110,7 @@ namespace Paramore.Brighter.MessagingGateway.MQTT
         /// Not implemented Acknowledge Method.
         /// </summary>
         /// <param name="message"></param>
+        /// <param name="cancellationToken">Allows cancellation of the acknowledge operation</param>
         public Task AcknowledgeAsync(Message message, CancellationToken cancellationToken = default)
         {
             return Task.CompletedTask;
@@ -105,14 +119,16 @@ namespace Paramore.Brighter.MessagingGateway.MQTT
 
         public void Dispose()
         {
+            _requeueProducer?.Dispose();
             _mqttClient.Dispose();
         }
 
 
-        public ValueTask DisposeAsync()
+        public async ValueTask DisposeAsync()
         {
+            if (_requeueProducer != null) await _requeueProducer.DisposeAsync();
+            // IMqttClient only implements IDisposable, not IAsyncDisposable (MQTTnet 4.3)
             _mqttClient.Dispose();
-            return new ValueTask(Task.CompletedTask);
         }
 
         /// <summary>
@@ -139,7 +155,7 @@ namespace Paramore.Brighter.MessagingGateway.MQTT
         /// <param name="timeOut">The time to delay retrieval. Defaults to 300ms</param>
         public Message[] Receive(TimeSpan? timeOut = null)
         {
-            if (_messageQueue.Count == 0)
+            if (_messageQueue.IsEmpty)
             {
                 return new[] { _noopMessage };
             }
@@ -149,18 +165,9 @@ namespace Paramore.Brighter.MessagingGateway.MQTT
 
             using (var cts = new CancellationTokenSource(timeOut.Value))
             {
-                cts.Token.Register(() => { throw new TimeoutException(); });
-                while (!cts.IsCancellationRequested && _messageQueue.Count > 0)
+                while (!cts.IsCancellationRequested && _messageQueue.TryDequeue(out var message))
                 {
-                    try
-                    {
-                        Message message = _messageQueue.Dequeue();
-                        messages.Add(message);
-                    }
-                    catch (TimeoutException te)
-                    {
-                        Log.MqttMessageConsumerTimedOutRetrievingMessages(s_logger, te, _messageQueue.Count);
-                    }
+                    messages.Add(message);
                 }
             }
 
@@ -191,19 +198,84 @@ namespace Paramore.Brighter.MessagingGateway.MQTT
 
 
         /// <summary>
-        /// Not implemented Requeue Method.
+        /// Requeues a message by publishing it back to the same topic via a lazily-created producer.
+        /// When a delay is specified and a scheduler is configured, the producer delegates to the
+        /// scheduler for delayed redelivery. For immediate requeue, the message is sent directly.
         /// </summary>
-        /// <param name="message"></param>
-        /// <param name="delay"></param>
+        /// <param name="message">The message to requeue.</param>
+        /// <param name="delay">Optional delay before the message becomes available. Requires a scheduler when non-zero.</param>
+        /// <returns><c>true</c> if the message was successfully requeued.</returns>
         public bool Requeue(Message message, TimeSpan? delay = null)
         {
-            return false;
+            delay ??= TimeSpan.Zero;
+
+            if (delay > TimeSpan.Zero)
+            {
+                EnsureRequeueProducer();
+                _requeueProducer!.SendWithDelay(message, delay);
+            }
+            else
+            {
+                // MQTT is pub/sub — immediate requeue must publish back to the topic
+                EnsureRequeueProducer();
+                _requeueProducer!.Send(message);
+            }
+
+            return true;
         }
 
-        public Task<bool> RequeueAsync(Message message, TimeSpan? delay = null,
+        /// <summary>
+        /// Requeues a message asynchronously by publishing it back to the same topic via a lazily-created producer.
+        /// When a delay is specified and a scheduler is configured, the producer delegates to the
+        /// scheduler for delayed redelivery. For immediate requeue, the message is sent directly.
+        /// </summary>
+        /// <param name="message">The message to requeue.</param>
+        /// <param name="delay">Optional delay before the message becomes available. Requires a scheduler when non-zero.</param>
+        /// <param name="cancellationToken">Allows cancellation of the requeue operation.</param>
+        /// <returns><c>true</c> if the message was successfully requeued.</returns>
+        public async Task<bool> RequeueAsync(Message message, TimeSpan? delay = null,
             CancellationToken cancellationToken = default)
         {
-            return Task.FromResult(false);
+            delay ??= TimeSpan.Zero;
+
+            if (delay > TimeSpan.Zero)
+            {
+                EnsureRequeueProducer();
+                await _requeueProducer!.SendWithDelayAsync(message, delay, cancellationToken);
+            }
+            else
+            {
+                // MQTT is pub/sub — immediate requeue must publish back to the topic
+                EnsureRequeueProducer();
+                await _requeueProducer!.SendAsync(message, cancellationToken);
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Ensures a requeue producer exists, creating one lazily on first use.
+        /// Uses <see cref="LazyInitializer.EnsureInitialized{T}(ref T, ref bool, ref object, Func{T})"/> for thread-safe initialization.
+        /// </summary>
+        private void EnsureRequeueProducer()
+        {
+            LazyInitializer.EnsureInitialized(ref _requeueProducer, ref _requeueProducerInitialized,
+                ref _requeueProducerLock, () =>
+                {
+                    var publisher = new MqttMessagePublisher(new MqttMessagingGatewayProducerConfiguration
+                    {
+                        Hostname = _configuration.Hostname,
+                        Port = _configuration.Port,
+                        TopicPrefix = _configuration.TopicPrefix,
+                        CleanSession = _configuration.CleanSession,
+                        Username = _configuration.Username,
+                        Password = _configuration.Password
+                    });
+                    return new MqttMessageProducer(publisher, new Publication())
+                    {
+                        Scheduler = _scheduler
+                    };
+                });
         }
 
         private async Task Connect(int connectionAttempts)

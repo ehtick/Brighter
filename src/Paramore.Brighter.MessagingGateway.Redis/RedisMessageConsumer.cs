@@ -43,11 +43,16 @@ namespace Paramore.Brighter.MessagingGateway.Redis
 
         private static readonly ILogger s_logger = ApplicationLogging.CreateLogger<RedisMessageConsumer>();
         private const string QUEUES = "queues";
-        
+
         private readonly ChannelName _queueName;
-        
+        private readonly RedisMessagingGatewayConfiguration _redisConfiguration;
+        private readonly IAmAMessageScheduler? _scheduler;
+        private RedisMessageProducer? _requeueProducer;
+        private bool _requeueProducerInitialized;
+        private object? _requeueProducerLock;
+
         private readonly Dictionary<string, string> _inflight = new();
- 
+
         /// <summary>
         /// Creates a consumer that reads from a List in Redis via a BLPOP (so will block).
         /// </summary>
@@ -55,13 +60,31 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         /// <param name="queueName">Key of the list in Redis we want to read from</param>
         /// <param name="topic">The topic that the list subscribes to</param>
         public RedisMessageConsumer(
-            RedisMessagingGatewayConfiguration redisMessagingGatewayConfiguration, 
-            ChannelName queueName, 
+            RedisMessagingGatewayConfiguration redisMessagingGatewayConfiguration,
+            ChannelName queueName,
             RoutingKey topic)
+            :this(redisMessagingGatewayConfiguration, queueName, topic, null)
+        {
+        }
+
+        /// <summary>
+        /// Creates a consumer that reads from a List in Redis via a BLPOP (so will block).
+        /// </summary>
+        /// <param name="redisMessagingGatewayConfiguration">Configuration for our Redis client etc.</param>
+        /// <param name="queueName">Key of the list in Redis we want to read from</param>
+        /// <param name="topic">The topic that the list subscribes to</param>
+        /// <param name="scheduler">Optional scheduler for delayed requeue support</param>
+        public RedisMessageConsumer(
+            RedisMessagingGatewayConfiguration redisMessagingGatewayConfiguration,
+            ChannelName queueName,
+            RoutingKey topic,
+            IAmAMessageScheduler? scheduler)
             :base(redisMessagingGatewayConfiguration, topic)
         {
             _queueName = queueName;
-       }
+            _redisConfiguration = redisMessagingGatewayConfiguration;
+            _scheduler = scheduler;
+        }
 
         /// <summary>
         /// Acknowledge the message, removing it from the queue 
@@ -111,15 +134,17 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         /// </remarks> 
         public void Dispose()
         {
+            _requeueProducer?.Dispose();
             DisposePool();
             GC.SuppressFinalize(this);
         }
 
-        /// <inheritdoc cref="IAsyncDisposable"/> 
+        /// <inheritdoc cref="IAsyncDisposable"/>
         public async ValueTask DisposeAsync()
         {
+            if (_requeueProducer != null) await _requeueProducer.DisposeAsync();
             await DisposePoolAsync().ConfigureAwait(false);
-            GC.SuppressFinalize(this); 
+            GC.SuppressFinalize(this);
         }
         
         /// <summary>
@@ -145,10 +170,10 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         { 
             Log.PurgingChannel(s_logger, _queueName);
             
-            var client = await GetClientAsync(cancellationToken);
+            await using var client = await GetClientAsync(cancellationToken);
             if (client == null)
                 throw new ChannelFailureException("RedisMessagingGateway: No Redis client available");
-            
+
             //This kills the queue, not the messages, which we assume expire
             await client.RemoveAllFromListAsync(_queueName, token: cancellationToken);
         }
@@ -276,19 +301,41 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         /// <summary>
         /// Requeues the specified message.
         /// </summary>
-        /// <param name="message"></param>
-        /// <param name="delay">Delay is not supported</param>
+        /// <param name="message">The message to requeue</param>
+        /// <param name="delay">Delay before the message becomes visible again</param>
         /// <returns>True if the message was requeued</returns>
-         public bool Requeue(Message message, TimeSpan? delay = null)
+        public bool Requeue(Message message, TimeSpan? delay = null)
         {
-           message.Header.HandledCount++;
+            delay ??= TimeSpan.Zero;
+
+            if (delay > TimeSpan.Zero)
+            {
+                if (_scheduler == null)
+                {
+                    throw new ConfigurationException(
+                        $"RedisMessageConsumer: delay of {delay} was requested for requeue but no scheduler is configured; configure a scheduler via MessageSchedulerFactory.");
+                }
+
+                _inflight.TryGetValue(message.Id, out string? removedMsgId);
+                _inflight.Remove(message.Id);
+                try
+                {
+                    EnsureRequeueProducer();
+                    _requeueProducer!.SendWithDelay(message, delay);
+                    return true;
+                }
+                catch
+                {
+                    if (removedMsgId != null)
+                        _inflight[message.Id] = removedMsgId;
+                    throw;
+                }
+            }
+
             using var client = GetClient();
             if (client == null)
                 throw new ChannelFailureException("RedisMessagingGateway: No Redis client available");
-            
-            //TODO: we removed delay support here because it blocked the pump
-            // Return to this once we have scheduled message support
-            
+
             if (_inflight.TryGetValue(message.Id, out string? msgId))
             {
                 client.AddItemToList(_queueName, msgId);
@@ -307,20 +354,42 @@ namespace Paramore.Brighter.MessagingGateway.Redis
         /// <summary>
         /// Requeues the specified message.
         /// </summary>
-        /// <param name="message"></param>
-        /// <param name="delay">Delay is not supported</param>
+        /// <param name="message">The message to requeue</param>
+        /// <param name="delay">Delay before the message becomes visible again</param>
         /// <param name="cancellationToken">Cancel the requeue operation</param>
         /// <returns>True if the message was requeued</returns>
         public async Task<bool> RequeueAsync(Message message, TimeSpan? delay = null, CancellationToken cancellationToken = default(CancellationToken))
         {
-            message.Header.HandledCount++;
-            var client = await GetClientAsync(cancellationToken);
+            delay ??= TimeSpan.Zero;
+
+            if (delay > TimeSpan.Zero)
+            {
+                if (_scheduler == null)
+                {
+                    throw new ConfigurationException(
+                        $"RedisMessageConsumer: delay of {delay} was requested for requeue but no scheduler is configured; configure a scheduler via MessageSchedulerFactory.");
+                }
+
+                _inflight.TryGetValue(message.Id, out string? removedMsgId);
+                _inflight.Remove(message.Id);
+                try
+                {
+                    EnsureRequeueProducer();
+                    await _requeueProducer!.SendWithDelayAsync(message, delay, cancellationToken);
+                    return true;
+                }
+                catch
+                {
+                    if (removedMsgId != null)
+                        _inflight[message.Id] = removedMsgId;
+                    throw;
+                }
+            }
+
+            await using var client = await GetClientAsync(cancellationToken);
             if (client == null)
                 throw new ChannelFailureException("RedisMessagingGateway: No Redis client available");
-            
-            //TODO: we removed delay support here because it blocked the pump
-            // Return to this once we have scheduled message support
-            
+
             if (_inflight.TryGetValue(message.Id, out string? msgId))
             {
                 await client.AddItemToListAsync(_queueName, msgId, cancellationToken);
@@ -333,9 +402,20 @@ namespace Paramore.Brighter.MessagingGateway.Redis
             {
                 Log.MessageNotFoundInFlight(s_logger, message.Id);
                 return false;
-            } 
+            }
         }
         
+        private void EnsureRequeueProducer()
+        {
+            LazyInitializer.EnsureInitialized(ref _requeueProducer, ref _requeueProducerInitialized,
+                ref _requeueProducerLock, () => new RedisMessageProducer(
+                    _redisConfiguration,
+                    new RedisMessagePublication { Topic = Topic })
+                {
+                    Scheduler = _scheduler
+                });
+        }
+
         // Virtual to allow testing to simulate client failure
         protected virtual IRedisClient? GetClient()
         {
@@ -353,6 +433,10 @@ namespace Paramore.Brighter.MessagingGateway.Redis
             catch(RedisException re)
             {
                 throw new ChannelFailureException("RedisMessagingGateway: Error on getting client from pool", re);
+            }
+            catch(ObjectDisposedException ode)
+            {
+                throw new ChannelFailureException("RedisMessagingGateway: Connection pool has been disposed", ode);
             }
         }
 
@@ -373,6 +457,10 @@ namespace Paramore.Brighter.MessagingGateway.Redis
             catch(RedisException re)
             {
                 throw new ChannelFailureException("RedisMessagingGateway: Error on getting client from pool", re);
+            }
+            catch(ObjectDisposedException ode)
+            {
+                throw new ChannelFailureException("RedisMessagingGateway: Connection pool has been disposed", ode);
             }
         }
             
@@ -440,10 +528,10 @@ namespace Paramore.Brighter.MessagingGateway.Redis
 
         private static partial class Log
         {
-            [LoggerMessage(LogLevel.Information, "RmqMessageConsumer: Acknowledging message {Id}")]
+            [LoggerMessage(LogLevel.Information, "RedisMessageConsumer: Acknowledging message {Id}")]
             public static partial void AcknowledgingMessage(ILogger logger, string id);
 
-            [LoggerMessage(LogLevel.Debug, "RmqMessageConsumer: Purging channel {ChannelName}")]
+            [LoggerMessage(LogLevel.Debug, "RedisMessageConsumer: Purging channel {ChannelName}")]
             public static partial void PurgingChannel(ILogger logger, ChannelName channelName);
             
             [LoggerMessage(LogLevel.Debug, "RedisMessageConsumer: Preparing to retrieve next message from queue {ChannelName} with routing key {Topic}")]
@@ -464,7 +552,7 @@ namespace Paramore.Brighter.MessagingGateway.Redis
             [LoggerMessage(LogLevel.Information, "Redis: Received message from queue {ChannelName} with routing key {Topic}, message: {Request}")]
             public static partial void ReceivedMessageFromQueue(ILogger logger, ChannelName channelName, RoutingKey topic, string request);
             
-            [LoggerMessage(LogLevel.Debug, "RmqMessageConsumer: Time out without receiving message from queue {ChannelName} with routing key {Topic}")]
+            [LoggerMessage(LogLevel.Debug, "RedisMessageConsumer: Time out without receiving message from queue {ChannelName} with routing key {Topic}")]
             public static partial void TimeoutWithoutReceivingMessage(ILogger logger, ChannelName channelName, RoutingKey topic);
             
             [LoggerMessage(LogLevel.Error, "Expected to find message id {MessageId} in-flight but was not")]
