@@ -1,6 +1,6 @@
 #region Licence
 /* The MIT License (MIT)
-Copyright © 2017 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
+Copyright © 2026 Ian Cooper <ian_hammond_cooper@yahoo.co.uk>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -25,7 +25,7 @@ THE SOFTWARE. */
 namespace Paramore.Brighter.MessagingGateway.MQTT
 {
     /// <summary>
-    /// Creates <see cref="MqttMessageConsumer"/> instances for MQTT subscriptions.
+    /// Creates MQTT message consumers from subscriptions, extracting DLQ routing keys when configured.
     /// </summary>
     public class MqttMessageConsumerFactory : IAmAMessageConsumerFactory
     {
@@ -45,7 +45,7 @@ namespace Paramore.Brighter.MessagingGateway.MQTT
         /// <summary>
         /// Initializes a new instance of the <see cref="MqttMessageConsumerFactory"/> class.
         /// </summary>
-        /// <param name="configuration">The MQTT messaging gateway consumer configuration</param>
+        /// <param name="configuration">The MQTT consumer configuration containing broker connection details.</param>
         /// <param name="scheduler">The optional message scheduler for delayed requeue support</param>
         public MqttMessageConsumerFactory(
             MqttMessagingGatewayConsumerConfiguration configuration,
@@ -58,21 +58,27 @@ namespace Paramore.Brighter.MessagingGateway.MQTT
         /// <summary>
         /// Creates a synchronous consumer for the specified subscription.
         /// </summary>
-        /// <param name="subscription">The subscription to create a consumer for</param>
-        /// <returns>IAmAMessageConsumerSync</returns>
+        /// <param name="subscription">The subscription to create a consumer for.</param>
+        /// <returns>An <see cref="IAmAMessageConsumerSync"/> for consuming messages.</returns>
         public IAmAMessageConsumerSync Create(Subscription subscription)
         {
-            return new MqttMessageConsumer(_configuration, _scheduler);
+            var deadLetterRoutingKey = (subscription as IUseBrighterDeadLetterSupport)?.DeadLetterRoutingKey;
+            var invalidMessageRoutingKey = (subscription as IUseBrighterInvalidMessageSupport)?.InvalidMessageRoutingKey;
+
+            return new MqttMessageConsumer(_configuration, _scheduler, deadLetterRoutingKey, invalidMessageRoutingKey);
         }
 
         /// <summary>
         /// Creates an asynchronous consumer for the specified subscription.
         /// </summary>
-        /// <param name="subscription">The subscription to create a consumer for</param>
-        /// <returns>IAmAMessageConsumerAsync</returns>
+        /// <param name="subscription">The subscription to create a consumer for.</param>
+        /// <returns>An <see cref="IAmAMessageConsumerAsync"/> for consuming messages asynchronously.</returns>
         public IAmAMessageConsumerAsync CreateAsync(Subscription subscription)
         {
-            return new MqttMessageConsumer(_configuration, _scheduler);
+            var deadLetterRoutingKey = (subscription as IUseBrighterDeadLetterSupport)?.DeadLetterRoutingKey;
+            var invalidMessageRoutingKey = (subscription as IUseBrighterInvalidMessageSupport)?.InvalidMessageRoutingKey;
+
+            return new MqttMessageConsumer(_configuration, _scheduler, deadLetterRoutingKey, invalidMessageRoutingKey);
         }
     }
 }

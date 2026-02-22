@@ -140,16 +140,19 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
 
             _deadLetterRoutingKey = deadLetterRoutingKey;
             _invalidMessageRoutingKey = invalidMessageRoutingKey;
+            // LazyThreadSafetyMode.None: message pumps are single-threaded per consumer, so no
+            // thread-safety mode is needed. None does not cache exceptions, allowing the factory
+            // to retry on the next .Value access after a transient failure.
             if (_deadLetterRoutingKey != null)
             {
                 _deadLetterProducer = new Lazy<KafkaMessageProducer?>(
-                    () => CreateProducer(_deadLetterRoutingKey, Log.ErrorCreatingDLQ));
+                    () => CreateProducer(_deadLetterRoutingKey, Log.ErrorCreatingDLQ), LazyThreadSafetyMode.None);
             }
 
             if (_invalidMessageRoutingKey != null)
             {
                 _invalidMessageProducer = new Lazy<KafkaMessageProducer?>(
-                    () => CreateProducer(_invalidMessageRoutingKey, Log.ErrorCreatingInvalidMessage));
+                    () => CreateProducer(_invalidMessageRoutingKey, Log.ErrorCreatingInvalidMessage), LazyThreadSafetyMode.None);
             }
             
             sessionTimeout ??= TimeSpan.FromSeconds(10);
@@ -450,19 +453,19 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
                     CheckHasPartitions();
                     
                     Log.NoMessagesAvailable(s_logger);
-                    return new[] {new Message()};
+                    return [new Message()];
                 }
 
                 if (consumeResult.IsPartitionEOF)
                 {
                     Log.EndOfPartition(s_logger, _consumer.MemberId);
-                    return new[] {new Message()};
+                    return [new Message()];
                 }
 
                 Log.UsableMessageRetrieved(s_logger, consumeResult.Message.Value);
                 Log.PartitionOffsetValue(s_logger, consumeResult.Partition, consumeResult.Offset, consumeResult.Message.Value);
 
-                return new[] {_creator.CreateMessage(consumeResult)};
+                return [_creator.CreateMessage(consumeResult)];
             }
             catch (ConsumeException consumeException)
             {
@@ -533,7 +536,7 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
         /// <returns>True if the message has been removed from the channel, false otherwise</returns>
         public bool Reject(Message message, MessageRejectionReason? reason = null)
         {
-             // If no reason provided or no channels configured, just acknowledge
+              // If no reason provided or no channels configured, just acknowledge
               if (_deadLetterProducer == null && _invalidMessageProducer == null)
               {
                   if (reason != null)
@@ -988,7 +991,7 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
             message.Header.Bag[HeaderNames.REJECTION_REASON] = reason.RejectionReason.ToString();
             if (!string.IsNullOrEmpty(reason.Description))
             {
-                message.Header.Bag[HeaderNames.REJECTION_MESSAGE] = reason.Description!;
+                message.Header.Bag[HeaderNames.REJECTION_MESSAGE] = reason.Description ?? string.Empty;
             }
         }
 
