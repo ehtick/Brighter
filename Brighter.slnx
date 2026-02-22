@@ -268,9 +268,7 @@
   <Project Path="src/Paramore.Brighter.Spanner/Paramore.Brighter.Spanner.csproj" />
   <Project Path="src/Paramore.Brighter.Sqlite.EntityFrameworkCore/Paramore.Brighter.Sqlite.EntityFrameworkCore.csproj" />
   <Project Path="src/Paramore.Brighter.Sqlite/Paramore.Brighter.Sqlite.csproj" />
-  <Project Path="src/Paramore.Brighter.Testing/Paramore.Brighter.Testing.csproj">
-    <Build Solution="Debug|*" Project="false" />
-  </Project>
+  <Project Path="src/Paramore.Brighter.Testing/Paramore.Brighter.Testing.csproj" />
   <Project Path="src/Paramore.Brighter.Transformers.AWS.V4/Paramore.Brighter.Transformers.AWS.V4.csproj" />
   <Project Path="src/Paramore.Brighter.Transformers.AWS/Paramore.Brighter.Transformers.AWS.csproj" />
   <Project Path="src/Paramore.Brighter.Transformers.Azure/Paramore.Brighter.Transformers.Azure.csproj" />

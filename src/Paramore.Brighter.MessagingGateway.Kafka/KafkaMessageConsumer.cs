@@ -345,6 +345,27 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
         }
         
         /// <summary>
+        /// Nacks the specified message. For Kafka (stream-based), this is a no-op because not committing
+        /// the offset is sufficient to allow redelivery.
+        /// </summary>
+        /// <param name="message">The message.</param>
+        public void Nack(Message message)
+        {
+            // No-op for Kafka: not committing the offset is sufficient for redelivery
+        }
+
+        /// <summary>
+        /// Nacks the specified message. For Kafka (stream-based), this is a no-op because not committing
+        /// the offset is sufficient to allow redelivery.
+        /// </summary>
+        /// <param name="message">The message.</param>
+        /// <param name="cancellationToken">Cancel the nack operation</param>
+        public Task NackAsync(Message message, CancellationToken cancellationToken = default)
+        {
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
         /// Close the consumer
         /// - Commit any outstanding offsets
         /// - Surrender any assignments
@@ -581,8 +602,9 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
               }
               catch (Exception ex)
               {
-                  // Log the error but acknowledge anyway to prevent message from being reprocessed
                   Log.ErrorSendingToRejectionChannel(s_logger, ex, message.Header.MessageId, rejectionReason.ToString());
+                  Acknowledge(message);
+                  return true;
               }
 
               AcknowledgeOffset(partitionOffset);
@@ -646,8 +668,9 @@ namespace Paramore.Brighter.MessagingGateway.Kafka
             }
             catch (Exception ex)
             {
-                // Log the error but acknowledge anyway to prevent message from being reprocessed
                 Log.ErrorSendingToRejectionChannel(s_logger, ex, message.Header.MessageId, rejectionReason.ToString());
+                await AcknowledgeAsync(message, cancellationToken);
+                return true;
             }
 
             AcknowledgeOffset(partitionOffset);

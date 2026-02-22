@@ -198,6 +198,26 @@ namespace Paramore.Brighter.MessagingGateway.RMQ.Sync
         }
         
         /// <summary>
+        /// Nacks the specified message, releasing it back to RabbitMQ for redelivery.
+        /// </summary>
+        /// <param name="message">The message.</param>
+        public void Nack(Message message)
+        {
+            var deliveryTag = message.DeliveryTag;
+            try
+            {
+                EnsureBroker();
+                Log.NackingMessage(s_logger, message.Id, deliveryTag);
+                Channel!.BasicNack(deliveryTag, false, true);
+            }
+            catch (Exception exception)
+            {
+                Log.ErrorNackingMessage(s_logger, exception, message.Id, deliveryTag);
+                throw;
+            }
+        }
+
+        /// <summary>
         /// Receives the specified queue name.
         /// </summary>
         /// <param name="timeOut">The timeout in milliseconds. We retry on timeout 5 ms intervals, with a min of 5ms
@@ -352,7 +372,6 @@ namespace Paramore.Brighter.MessagingGateway.RMQ.Sync
         }
 
 
-  
 
         private void EnsureProducer()
         {
@@ -364,6 +383,7 @@ namespace Paramore.Brighter.MessagingGateway.RMQ.Sync
                 });
 #pragma warning restore CS0420
         }
+
 
         protected virtual void EnsureChannel()
         {
@@ -564,6 +584,12 @@ namespace Paramore.Brighter.MessagingGateway.RMQ.Sync
 
             [LoggerMessage(LogLevel.Error, "RmqMessageConsumer: Error re-queueing message {Id}")]
             public static partial void ErrorRequeueingMessage(ILogger logger, Exception exception, string id);
+
+            [LoggerMessage(LogLevel.Information, "RmqMessageConsumer: Nacking message {Id} with delivery tag {DeliveryTag} for redelivery")]
+            public static partial void NackingMessage(ILogger logger, string id, ulong deliveryTag);
+
+            [LoggerMessage(LogLevel.Error, "RmqMessageConsumer: Error nacking message {Id} with delivery tag {DeliveryTag}")]
+            public static partial void ErrorNackingMessage(ILogger logger, Exception exception, string id, ulong deliveryTag);
 
             [LoggerMessage(LogLevel.Information, "RmqMessageConsumer: NoAck message {Id} with delivery tag {DeliveryTag} because {Reason} due to {Description}")]
             public static partial void NoAckMessage(ILogger logger, string id, ulong deliveryTag, string reason, string description);

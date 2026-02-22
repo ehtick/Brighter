@@ -98,8 +98,22 @@ public partial class RocketMessageConsumer(SimpleConsumer consumer,
     }
     
     /// <inheritdoc />
+    public void Nack(Message message)
+    {
+        // No-op for RocketMQ: invisibility timeout will expire and message will become available for redelivery
+    }
+
+    /// <inheritdoc />
+    public Task NackAsync(Message message, CancellationToken cancellationToken = default)
+    {
+        // No-op for RocketMQ: invisibility timeout will expire and message will become available for redelivery
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
     public bool Reject(Message message, MessageRejectionReason? reason)
         => BrighterAsyncContext.Run(() => RejectAsync(message, reason));
+
 
     /// <inheritdoc />
     public async Task<bool> RejectAsync(Message message, MessageRejectionReason? reason = null, CancellationToken cancellationToken = default)
