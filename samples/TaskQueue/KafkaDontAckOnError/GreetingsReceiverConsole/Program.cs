@@ -51,7 +51,7 @@ var host = Host.CreateDefaultBuilder(args)
     })
     .ConfigureServices((_, services) =>
     {
-        // This sample intentionally throws on every 5th message to demonstrate RejectMessageOnError.
+        // This sample intentionally throws on every 5th message to demonstrate DontAckOnError.
         // Setting unacceptableMessageLimitWindow to zero resets the unacceptable message count on every
         // pump cycle, preventing the pump from shutting down due to accumulated error counts.
         var subscriptions = new KafkaSubscription[]
@@ -60,7 +60,7 @@ var host = Host.CreateDefaultBuilder(args)
                 new SubscriptionName("paramore.example.greeting"),
                 channelName: new ChannelName("greeting.event"),
                 routingKey: new RoutingKey("greeting.event"),
-                groupId: "kafka-GreetingsReceiverConsole-DLQ-Sample",
+                groupId: "kafka-DontAckOnError-Sample",
                 numOfPartitions: 3,
                 timeOut: TimeSpan.FromMilliseconds(100),
                 offsetDefault: AutoOffsetReset.Earliest,
@@ -68,7 +68,6 @@ var host = Host.CreateDefaultBuilder(args)
                 sweepUncommittedOffsetsInterval: TimeSpan.FromMilliseconds(10000),
                 messagePumpType: MessagePumpType.Proactor,
                 makeChannels: OnMissingChannel.Create,
-                deadLetterRoutingKey: new RoutingKey("greeting.event.dlq"),
                 unacceptableMessageLimitWindow: TimeSpan.Zero)
         };
 
@@ -85,11 +84,8 @@ var host = Host.CreateDefaultBuilder(args)
             options.Subscriptions = subscriptions;
             options.DefaultChannelFactory = new ChannelFactory(consumerFactory);
         })
-        // InMemorySchedulerFactory is the default — shown here explicitly to demonstrate scheduler configuration.
-        // Replace with HangfireMessageSchedulerFactory or QuartzSchedulerFactory for durable scheduling.
         .UseScheduler(new InMemorySchedulerFactory())
         .AutoFromAssemblies();
-
 
         services.AddHostedService<ServiceActivatorHostedService>();
     })

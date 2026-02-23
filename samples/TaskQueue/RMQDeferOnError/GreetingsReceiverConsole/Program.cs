@@ -25,14 +25,13 @@ THE SOFTWARE. */
 
 using System;
 using System.IO;
-using Confluent.Kafka;
 using Greetings.Ports.Commands;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Paramore.Brighter;
-using Paramore.Brighter.MessagingGateway.Kafka;
+using Paramore.Brighter.MessagingGateway.RMQ.Async;
 using Paramore.Brighter.Extensions.DependencyInjection;
 using Paramore.Brighter.ServiceActivator.Extensions.DependencyInjection;
 using Paramore.Brighter.ServiceActivator.Extensions.Hosting;
@@ -51,45 +50,39 @@ var host = Host.CreateDefaultBuilder(args)
     })
     .ConfigureServices((_, services) =>
     {
-        // This sample intentionally throws on every 5th message to demonstrate RejectMessageOnError.
+        // This sample intentionally defers every 3rd message to demonstrate DeferMessageAction.
         // Setting unacceptableMessageLimitWindow to zero resets the unacceptable message count on every
         // pump cycle, preventing the pump from shutting down due to accumulated error counts.
-        var subscriptions = new KafkaSubscription[]
+        var subscriptions = new Subscription[]
         {
-            new KafkaSubscription<GreetingEvent>(
+            new RmqSubscription<GreetingEvent>(
                 new SubscriptionName("paramore.example.greeting"),
-                channelName: new ChannelName("greeting.event"),
-                routingKey: new RoutingKey("greeting.event"),
-                groupId: "kafka-GreetingsReceiverConsole-DLQ-Sample",
-                numOfPartitions: 3,
-                timeOut: TimeSpan.FromMilliseconds(100),
-                offsetDefault: AutoOffsetReset.Earliest,
-                commitBatchSize: 5,
-                sweepUncommittedOffsetsInterval: TimeSpan.FromMilliseconds(10000),
+                new ChannelName("greeting.event"),
+                new RoutingKey("greeting.event"),
+                timeOut: TimeSpan.FromMilliseconds(2000),
+                isDurable: true,
+                highAvailability: true,
                 messagePumpType: MessagePumpType.Proactor,
                 makeChannels: OnMissingChannel.Create,
-                deadLetterRoutingKey: new RoutingKey("greeting.event.dlq"),
                 unacceptableMessageLimitWindow: TimeSpan.Zero)
         };
 
-        //create the gateway
-        var consumerFactory = new KafkaMessageConsumerFactory(
-            new KafkaMessagingGatewayConfiguration
-            {
-                Name = "paramore.brighter", BootStrapServers = new[] { "localhost:9092" }
-            }
-        );
+        var rmqConnection = new RmqMessagingGatewayConnection
+        {
+            AmpqUri = new AmqpUriSpecification(new Uri("amqp://guest:guest@localhost:5672")),
+            Exchange = new Exchange("paramore.brighter.exchange")
+        };
+
+        var rmqMessageConsumerFactory = new RmqMessageConsumerFactory(rmqConnection);
 
         services.AddConsumers(options =>
         {
             options.Subscriptions = subscriptions;
-            options.DefaultChannelFactory = new ChannelFactory(consumerFactory);
+            options.DefaultChannelFactory = new ChannelFactory(rmqMessageConsumerFactory);
         })
-        // InMemorySchedulerFactory is the default — shown here explicitly to demonstrate scheduler configuration.
-        // Replace with HangfireMessageSchedulerFactory or QuartzSchedulerFactory for durable scheduling.
+        // InMemorySchedulerFactory provides requeue delay support for deferred messages.
         .UseScheduler(new InMemorySchedulerFactory())
         .AutoFromAssemblies();
-
 
         services.AddHostedService<ServiceActivatorHostedService>();
     })
